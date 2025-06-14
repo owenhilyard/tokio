@@ -5,6 +5,7 @@ use crate::util::check_socket_for_blocking;
 use std::fmt;
 use std::io;
 use std::net::{self, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::task::{ready, Context, Poll};
 
 cfg_io_util! {
@@ -125,6 +126,73 @@ cfg_net! {
 }
 
 impl UdpSocket {
+
+    /// Creates a new socket configured for IPv4.
+    ///
+    /// Calls `socket(2)` with `AF_INET` and `SOCK_DGRAM`.
+    ///
+    /// # Returns
+    ///
+    /// On success, the newly created `TcpSocket` is returned. If an error is
+    /// encountered, it is returned instead.
+    ///
+    /// # Examples
+    ///
+    /// Create a new IPv4 socket and start listening.
+    ///
+    /// ```no_run
+    /// use tokio::net::TcpSocket;
+    ///
+    /// use std::io;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> io::Result<()> {
+    ///     let addr = "127.0.0.1:8080".parse().unwrap();
+    ///     let socket = TcpSocket::new_v4()?;
+    ///     socket.bind(addr)?;
+    ///
+    ///     let listener = socket.listen(128)?;
+    /// # drop(listener);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn new_v4() -> io::Result<UdpSocket> {
+        UdpSocket::new_for_domain(socket2::Domain::IPV4)
+    }
+
+    /// Creates a new socket configured for IPv6.
+    ///
+    /// Calls `socket(2)` with `AF_INET6` and `SOCK_DGRAM`.
+    ///
+    /// # Returns
+    ///
+    /// On success, the newly created `TcpSocket` is returned. If an error is
+    /// encountered, it is returned instead.
+    ///
+    /// # Examples
+    ///
+    /// Create a new IPv6 socket and start listening.
+    ///
+    /// ```no_run
+    /// use tokio::net::TcpSocket;
+    ///
+    /// use std::io;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> io::Result<()> {
+    ///     let addr = "[::1]:8080".parse().unwrap();
+    ///     let socket = TcpSocket::new_v6()?;
+    ///     socket.bind(addr)?;
+    ///
+    ///     let listener = socket.listen(128)?;
+    /// # drop(listener);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn new_v6() -> io::Result<UdpSocket> {
+        UdpSocket::new_for_domain(socket2::Domain::IPV6)
+    }
+
     /// This function will create a new UDP socket and attempt to bind it to
     /// the `addr` provided.
     ///
@@ -175,6 +243,37 @@ impl UdpSocket {
     fn new(socket: mio::net::UdpSocket) -> io::Result<UdpSocket> {
         let io = PollEvented::new(socket)?;
         Ok(UdpSocket { io })
+    }
+
+    fn new_for_domain(domain: socket2::Domain) -> io::Result<UdpSocket> {
+        let ty = socket2::Type::DGRAM;
+        #[cfg(any(
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "linux",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
+        let ty = ty.nonblocking();
+        let inner = socket2::Socket::new(domain, ty, Some(socket2::Protocol::UDP))?;
+        #[cfg(not(any(
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "linux",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        )))]
+        inner.set_nonblocking(true)?;
+
+        let mio_socket = unsafe { mio::net::UdpSocket::from(OwnedFd::from_raw_fd(inner.into_raw_fd())) };
+
+        Ok(UdpSocket::new(mio_socket)?)
     }
 
     /// Creates new `UdpSocket` from a previously bound `std::net::UdpSocket`.
@@ -319,6 +418,38 @@ impl UdpSocket {
     /// ```
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.io.peer_addr()
+    }
+
+        /// Binds the socket to the given address.
+    ///
+    /// This calls the `bind(2)` operating-system function. Behavior is
+    /// platform specific. Refer to the target platform's documentation for more
+    /// details.
+    ///
+    /// # Examples
+    ///
+    /// Bind a socket before listening.
+    ///
+    /// ```no_run
+    /// use tokio::net::UdpSocket;
+    ///
+    /// use std::io;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> io::Result<()> {
+    ///     let addr = "127.0.0.1:8080".parse().unwrap();
+    ///
+    ///     let socket = UdpSocket::new_v4()?;
+    ///     socket.bind(addr)?;
+    ///
+    ///     let listener = socket.listen(1024)?;
+    /// # drop(listener);
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn late_bind(&self, addr: SocketAddr) -> io::Result<()> {
+        self.as_socket().bind(&addr.into())
     }
 
     /// Connects the UDP socket setting the default destination for send() and
@@ -1892,6 +2023,95 @@ impl UdpSocket {
     /// address.
     pub fn set_broadcast(&self, on: bool) -> io::Result<()> {
         self.io.set_broadcast(on)
+    }
+
+        /// Allows the socket to bind to an in-use port. Only available for unix systems
+    /// (excluding Solaris & Illumos).
+    ///
+    /// Behavior is platform specific. Refer to the target platform's
+    /// documentation for more details.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use tokio::net::UdpSocket;
+    ///
+    /// use std::io;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> io::Result<()> {
+    ///     let addr = "127.0.0.1:8080".parse().unwrap();
+    ///
+    ///     let socket = UdpSocket::new_v4()?;
+    ///     socket.set_reuseport(true)?;
+    ///     socket.bind(addr)?;
+    ///
+    ///     let listener = socket.listen(1024)?;
+    ///     Ok(())
+    /// }
+    /// ```
+    #[cfg(all(
+        unix,
+        not(target_os = "solaris"),
+        not(target_os = "illumos"),
+        not(target_os = "cygwin"),
+    ))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(
+            unix,
+            not(target_os = "solaris"),
+            not(target_os = "illumos"),
+            not(target_os = "cygwin"),
+        )))
+    )]
+    pub fn set_reuseport(&self, reuseport: bool) -> io::Result<()> {
+        self.as_socket().set_reuse_port(reuseport)
+    }
+
+    /// Allows the socket to bind to an in-use port. Only available for unix systems
+    /// (excluding Solaris & Illumos).
+    ///
+    /// Behavior is platform specific. Refer to the target platform's
+    /// documentation for more details.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use tokio::net::UdpSocket;
+    ///
+    /// use std::io;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> io::Result<()> {
+    ///     let addr = "127.0.0.1:8080".parse().unwrap();
+    ///
+    ///     let socket = UdpSocket::new_v4()?;
+    ///     socket.set_reuseport(true)?;
+    ///     assert!(socket.reuseport().unwrap());
+    ///     socket.bind(addr)?;
+    ///
+    ///     let listener = socket.listen(1024)?;
+    ///     Ok(())
+    /// }
+    /// ```
+    #[cfg(all(
+        unix,
+        not(target_os = "solaris"),
+        not(target_os = "illumos"),
+        not(target_os = "cygwin"),
+    ))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(
+            unix,
+            not(target_os = "solaris"),
+            not(target_os = "illumos"),
+            not(target_os = "cygwin"),
+        )))
+    )]
+    pub fn reuseport(&self) -> io::Result<bool> {
+        self.as_socket().reuse_port()
     }
 
     /// Gets the value of the `IP_MULTICAST_LOOP` option for this socket.
